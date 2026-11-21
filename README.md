@@ -1,130 +1,238 @@
 # cl-scope
 
-Structured concurrency on SBCL's native threads. A scope starts tasks, each in a thread, and does not end while one
-of them lives. A task is cancelled where it waits. A task that fails either cancels its scope or parks with its
-stack, and another thread answers it with a restart.
+Structured concurrency for SBCL on native OS threads — with **cooperative cancellation** and **live failure parking**.
 
-SBCL only: it uses `sb-thread`, `sb-ext` and `sb-bsd-sockets`, and nothing outside SBCL.
+- **Zero external dependencies**: uses only SBCL built-ins (`sb-thread`, `sb-ext`, `sb-bsd-sockets`).
+- **No leaked threads**: every task belongs to a lexical scope that joins all child tasks before exiting.
+- **Clean cancellation**: cancellations wake blocked waits (sleeps, channels, sockets, subprocess groups) via wakers instead of blindly interrupting threads.
+- **Park & recover in place**: with `:on-failure :park`, a failing task freezes on its real call stack instead of unwinding, letting another thread inspect its live state (`ask`), hot-redefine broken code, and resume it via Common Lisp restarts (`answer`).
+
+Package: `cl-scope` (nickname: `sc`). SBCL only.
+
+---
+
+## Quick Start
+
+### 1. Run tasks concurrently with automatic join and timeout
 
 ```lisp
-(sc:with-scope (s :timeout 30)
-  (sc:spawn (lambda () (sc:run "/bin/sh" '("-c" "make test"))))
-  (sc:spawn (lambda () (sc:read-line-from socket stream))))
+;; Wait for multiple tasks and collect their first return values in order.
+;; If any task fails (or 10s pass), all sibling tasks are cancelled and joined.
+(sc:gather (list (lambda () (sc:run "/bin/sh" '("-c" "echo one")))
+                 (lambda () (sc:run "/bin/sh" '("-c" "echo two"))))
+           :timeout 10)
+;; => ("one\n" "two\n")
 
-(sc:gather (list (lambda () (fetch a)) (lambda () (fetch b))))   ; => the two results, in order
+;; Or manage tasks explicitly inside a scope:
+(sc:with-scope (s :name "build" :timeout 30)
+  (let ((t1 (sc:spawn (lambda () (sc:run "/bin/sh" '("-c" "make test"))) :name "test"))
+        (t2 (sc:spawn (lambda () (sc:pause 0.5) :ready) :name "warmup")))
+    (declare (ignore t1 t2))
+    ;; The scope does not return until both tasks have finished (or been cancelled).
+    :started))
 ```
 
-The package is `cl-scope`, nickname `sc`.
+### 2. Freeze a failing task and recover it live (`:on-failure :park`)
 
-## Loading
+Instead of cancelling siblings and losing in-flight work on an unexpected error, park the failed task in place:
+
+```lisp
+(defun compute (x)
+  (error "buggy implementation for ~a" x))
+
+(let ((parked-events (sc:make-chan)))
+  (let ((sc:*on-park* (lambda (task) (sc:send parked-events task))))
+    ;; Supervisor thread: inspect the parked task, fix the function, and retry it.
+    (sb-thread:make-thread
+     (lambda ()
+       (let ((task (sc:recv parked-events)))
+         ;; Evaluate code inside the parked task's thread & dynamic bindings:
+         (format t "Failed with: ~a~%" (sc:task-condition task))
+         (format t "Stack: ~s~%" (sc:task-report task))
+         (format t "Restarts: ~s~%" (sc:task-restarts task))
+
+         ;; Hot-fix the broken function and resume the task in place:
+         (defun compute (x) (* x 2))
+         (sc:answer task 'sc:retry))))
+
+    ;; Sibling tasks keep running while the failed one is parked.
+    (sc:gather (list (lambda () (compute 21))
+                     (lambda () (sc:pause 0.1) :ok))
+               :on-failure :park)))
+;; => (42 :OK)
+```
+
+### 3. Make any blocking call cancellable (`call-with-waker`)
+
+```lisp
+(defun cancellable-read-byte (socket stream)
+  (sc:call-with-waker
+   ;; Waker: called from another thread when the scope is cancelled.
+   (lambda () (ignore-errors (sb-bsd-sockets:socket-shutdown socket :direction :io)))
+   ;; Blocking operation:
+   (lambda () (read-byte stream nil :eof))))
+```
+
+---
+
+## Core Concepts
+
+```text
+  with-scope (owns a cancellation token + task list)
+   ├── task A (:running)  ── waiting on pause / recv / run / socket / waker
+   ├── task B (:running)  ── nested with-scope (child token)
+   │    └── task B1       ── cancelled automatically when parent cancels
+   └── task C (signals an ERROR)
+        ├── :on-failure :cancel (default)
+        │     └─► cancels scope token ─► wakes A, B, B1 ─► joins all ─► signals TASK-ERROR
+        └── :on-failure :park
+              └─► freezes C on its real stack (A & B keep running)
+                  └─► supervisor inspects via ASK / resumes via ANSWER (restart)
+```
+
+### 1. Scopes and Lifetime
+- **Strict join**: `with-scope` never returns until every task spawned inside it has terminated and its OS thread has been joined.
+- **Closed on exit**: once a scope finishes joining, spawning into it signals an error. Calling `spawn` outside any scope is also an error.
+- **Body errors**: if the body of `with-scope` exits via a non-local transfer or error, all child tasks are cancelled and joined before the body's error propagates.
+- **Nesting**: scopes form a tree of cancellation tokens. Cancelling an outer scope cascades to all inner scopes; inner tasks unwind and finish before their parent task exits.
+- **Dynamic bindings (`*inherit*`)**: spawned threads do not blindly copy all thread-local bindings. Only special variables listed in `sc:*inherit*` (plus `*inherit*` itself) are captured at `spawn` time and bound in the child thread.
+
+### 2. Cooperative Cancellation
+Cancellation in `cl-scope` is **cooperative first, preemptive only as a last resort**:
+
+1. Every scope holds a cancellation token. Every built-in wait (`pause`, `recv`, `wait-on`, `run`, `read-line-from`) and `call-with-waker` registers a **waker** on that token.
+2. When a scope is cancelled (via `cancel-scope`, `:timeout`, a body error, or a sibling failure under `:on-failure :cancel`), all wakers fire immediately — broadcasting condition variables, shutting down sockets, or sending `SIGTERM` to subprocess groups — and the waiting call signals `sc:cancelled`.
+3. **`cancelled` is a `condition`, not an `error` or `serious-condition`**: task code using `(ignore-errors ...)` or `(handler-case ... (error ...))` will **not** accidentally swallow a cancellation.
+4. **Cleanup (`shielded`)**: waits inside an `unwind-protect` cleanup are also cancelled immediately unless wrapped in `(sc:shielded ...)`, which runs outside every scope's cancellation token.
+5. **Grace period & fallback**: if a cancelled task is stuck in a tight CPU loop or a non-`cl-scope` wait (such as `cl:sleep`) and does not exit within `:grace` seconds (default `1`), `cl-scope` falls back to `sb-thread:interrupt-thread`. If the thread still cannot be interrupted (e.g. inside `without-interrupts`), the scope stays open and signals `sc:stuck` (via `signal`) once per grace period until the task exits.
+
+### 3. Failure Parking (`:on-failure :park`)
+When a scope is created with `:on-failure :park`:
+
+- Any `error` signalled inside a task pauses that task **at the exact point of failure**, preserving its real SBCL call stack, local frames, and dynamic bindings. Non-`error` `serious-condition`s (such as stack/heap exhaustion) still unwind normally.
+- Sibling tasks in the same scope continue running unaffected.
+- Another thread (a REPL, supervisor, or agent) can:
+  - find parked tasks via `(sc:parked scope)` or receive them immediately via `sc:*on-park*`;
+  - inspect the failure via `task-condition`, `task-report` (trimmed backtrace), and `task-restarts`;
+  - run diagnostic code **inside the parked thread's dynamic context** via `(sc:ask task thunk)`;
+  - resume the task via `(sc:answer task restart-name &rest args)`.
+- **Built-in restarts**: unless spawned with `:restarts nil`, every task establishes three restarts alongside any restarts established by user code:
+  - `sc:retry` — re-run the task thunk from the start in the same thread (picking up any redefined functions).
+  - `sc:give-up` — end the task as `:failed`, cancelling the scope and signalling `task-error`.
+  - `sc:finish-with (&rest values)` — complete the task normally with `values`.
+- **Bad answers stay safe**: passing an unknown restart name, wrong arguments, or invoking a restart that returns without transferring control leaves the task `:parked` and records the reason in `(sc:task-note task)`.
+- **Scope cancellation wins**: if the scope is cancelled or times out while a task is parked, the parked task is woken and unwound cleanly.
+
+---
+
+## Installation & Loading
+
+`cl-scope` has no external dependencies. Load it directly with ASDF:
 
 ```lisp
 (asdf:load-asd "/path/to/cl-scope/cl-scope.asd")
 (asdf:load-system "cl-scope")
 ```
 
-Or put the directory in `CL_SOURCE_REGISTRY` (`/path/to/cl-scope//:`) and load the system by name.
+Or add its directory to `CL_SOURCE_REGISTRY` (e.g. `/path/to/cl-scope//:`) and call `(asdf:load-system "cl-scope")`.
 
-## Checks
+With [qlot](https://github.com/fukamachi/qlot):
 
-```sh
-./check.sh        # 25 checks through ASDF, about 6 s; -v prints what each measured
-./mutants.sh      # scope.lisp with one behaviour taken out, seven times; about 2 min
+```text
+git cl-scope git@github.com:nohzafk/cl-scope.git
 ```
 
-`(asdf:test-system "cl-scope")` runs the same checks. Both scripts take the sbcl on PATH, or `$SBCL`.
+---
 
-| Group | Checks | What they show |
+## API Reference
+
+### Scopes & Tasks
+
+| Symbol | Description |
+|---|---|
+| `(sc:with-scope (var &key name (on-failure :cancel) timeout (grace 1)) &body body)` | Run `body` with `var` bound to a new scope. Joins all spawned tasks before returning `body`'s values (or `nil` if cancelled directly on this scope). `:on-failure` is `:cancel` or `:park`. `:timeout` is in seconds. `:grace` is seconds before interrupting uncooperative tasks. |
+| `(sc:spawn fn &key name (scope *scope*) (restarts t))` | Start zero-arg `fn` in a new OS thread attached to `scope`; returns the `task`. Pass `:restarts nil` to omit the built-in `retry`, `give-up`, and `finish-with` restarts. |
+| `(sc:gather thunks &key name (on-failure :cancel) timeout)` | Run each zero-arg function in `thunks` concurrently in one scope and return a list of their first return values, in input order. |
+| `(sc:cancel-scope scope &optional (reason :asked))` | Cancel `scope` and all nested scopes. Returns `t` if this call triggered cancellation, `nil` if already cancelled. |
+| `(sc:scope-name scope)` / `(sc:scope-tasks scope)` | Access the scope's name and list of spawned tasks. |
+| `(sc:task-name task)` / `(sc:task-scope task)` / `(sc:task-thread task)` | Task metadata and underlying SBCL thread. |
+| `(sc:task-state task)` | Current state: `:running`, `:parked`, `:done`, `:failed`, or `:cancelled`. |
+| `(sc:task-values task)` | List of return values once `:done`. |
+| `(sc:task-condition task)` / `(sc:task-report task)` | Signalled condition and trimmed stack trace lines (list of strings) when `:parked` or `:failed`. |
+| `(sc:task-restarts task)` / `(sc:task-note task)` | Available restart names while `:parked`, and diagnostic message if the last `answer` failed. |
+
+### Cancellable Waits & Synchronization
+
+| Symbol | Description |
+|---|---|
+| `(sc:pause seconds)` | Sleep for `seconds`; wakes immediately with `cancelled` if the scope is cancelled. Returns `nil`. |
+| `(sc:make-chan)` | Create an unbounded thread-safe FIFO channel. |
+| `(sc:send chan x)` | Push `x` onto `chan` and wake waiters. Returns `x`. |
+| `(sc:recv chan &key timeout)` | Pop the next item from `chan`. Returns `(values item t)`, or `(values nil nil)` on timeout. Cancellable. |
+| `(sc:wait-on lock queue test &key timeout)` | Acquire `lock` and wait on `queue` until `(funcall test)` returns a non-nil value (called with `lock` held), or until `timeout` seconds pass (`nil`). Cancellable. |
+| `(sc:run program args)` | Run external `program` with string list `args`, merging stderr into stdout. Returns `(values output-string exit-code)`. On cancellation, terminates the process and its process group (`SIGTERM`, then `SIGKILL` on unwind). |
+| `(sc:read-line-from socket stream)` | Read one line from `stream` (or `:eof`). On cancellation, shuts `socket` down (`:direction :io`). |
+| `(sc:call-with-waker waker thunk)` | Run blocking `thunk`; if cancelled, invokes `waker` from the cancelling thread and signals `cancelled`. |
+| `(sc:check)` | Poll point: signals `cancelled` immediately if the current scope is cancelled. |
+| `(sc:shielded &body body)` | Evaluate `body` outside every scope's cancellation token (for cleanup that must complete). |
+
+### Parked Task Control (`:on-failure :park`)
+
+| Symbol | Description |
+|---|---|
+| `(sc:parked scope)` | Return the list of currently `:parked` tasks in `scope`. |
+| `(sc:answer task restart &rest args)` | Instruct a parked `task` to invoke `restart` with `args` inside its own thread. Returns `task`. |
+| `(sc:ask task thunk &key (timeout 5))` | Run zero-arg `thunk` inside the parked `task`'s thread (with its live dynamic bindings) and return its values (or `(:error message)` if `thunk` errors). |
+| `sc:retry` / `sc:give-up` / `sc:finish-with` | Built-in restart names offered by each task (unless `:restarts nil`). |
+
+### Conditions & Special Variables
+
+| Symbol | Kind | Notes |
 |---|---|---|
-| S, scopes | 9 | join, sibling cancel, body error, nested scopes inner-first, time limit, closed scope, ordered results, 200 tasks |
-| W, waits | 7 | each kind of wait ends at a cancellation; interrupt and `stuck` for the ones that do not |
-| P, park | 8 | a failed task parks with its stack and is answered from another thread |
-| | 1 | no check left a thread behind |
+| `sc:cancelled` | `condition` | Not an `error`. Reader: `(sc:cancelled-reason c)`. |
+| `sc:task-error` | `error` | Signalled by `with-scope` when a task fails. Readers: `sc:task-error-task`, `sc:task-error-condition`. |
+| `sc:timed-out` | `error` | Signalled by `with-scope` when `:timeout` expires. |
+| `sc:stuck` | `condition` | Signalled via `signal` every `:grace` seconds when cancelled tasks ignore interruption. Reader: `(sc:stuck-tasks c)`. |
+| `sc:*on-park*` | variable | `nil` or `(lambda (task) ...)`, called inside the failing task's thread right after it enters `:parked`. |
+| `sc:*inherit*` | variable | List of special variable symbols whose current bindings are copied into newly spawned tasks. |
 
-| Mutant | Caught by |
-|---|---|
-| a failed task does not cancel its scope | S2 S4 S5 P4 |
-| an error never parks | P1 P2 P3 P5 P6 P7 P8 |
-| a task spawned with `:restarts nil` offers `retry` all the same | P8 |
-| a task whose restart returned is marked running while it waits | P6 P8 |
-| `shielded` shields nothing | W7 |
-| a cancelled `run` signals only the process, not its group | W3 |
-| `cancel` calls no waker | the run does not end in 60 s |
+---
 
-## Scopes
+## Testing
 
-| | |
-|---|---|
-| `(with-scope (var &key name on-failure timeout grace) body...)` | Evaluate the body with a new scope; return when every task spawned in it has finished. |
-| `(spawn fn &key name scope restarts)` | Start `fn` as a task of the current scope. Returns the task. `:restarts nil`: the task offers no `retry`, `give-up` or `finish-with` of its own. |
-| `(wait-on lock queue test &key timeout)` | Wait on the waitqueue until `test`, called with the mutex held, gives a value; a cancellation ends the wait. |
-| `(gather thunks &key name on-failure timeout)` | One scope, one task per thunk; their first values in order. |
-| `(cancel-scope scope &optional reason)` | Cancel the scope and the scopes inside it. |
+Run the full check suite (25 checks, ~6 seconds) or the mutation suite (7 mutants, ~2 minutes):
 
-- **Join.** A scope whose body has returned waits for its tasks. A scope that has ended takes no new task.
-- **Failure.** With `:on-failure :cancel`, the default, the first task that fails cancels the others and the scope
-  signals `task-error`, which holds the task, its condition and its stack (`task-report`).
-- **Body.** A body that leaves by an error cancels the tasks and waits for them; the body's error is what leaves.
-- **Time limit.** `:timeout` seconds cancels the scope and signals `timed-out`.
-- **Special variables.** A task starts with the values of the variables named in `*inherit*`, and no other
-  binding of the thread that spawned it.
+```sh
+./check.sh        # -v prints measured timings and diagnostics
+./mutants.sh      # removes 7 core behaviours one by one and verifies each fails a check
+```
 
-## Cancellation
+Or from Lisp via ASDF:
 
-A cancellation is not delivered to a thread. It ends the wait the thread is in, and the wait signals `cancelled`.
+```lisp
+(asdf:test-system "cl-scope")
+```
 
-| Wait | |
-|---|---|
-| `(pause seconds)` | sleep |
-| `(recv chan &key timeout)`, `(send chan x)`, `(make-chan)` | an unbounded channel |
-| `(run program args)` | a child process: output and exit code. A cancellation terminates it and its process group. |
-| `(read-line-from socket stream)` | a line from a socket. A cancellation shuts the socket down. |
-| `(call-with-waker waker thunk)` | any blocking call, given a function that ends it from another thread |
-| `(check)` | no wait: signals `cancelled` if the scope is cancelled |
+The test suite (`test.lisp`) covers:
+- **S1–S9 (Scopes)**: join semantics, sibling cancellation on failure, body errors, nested inner-first unwind, timeouts, closed-scope rejection, `gather` ordering, `*inherit*`, and 200 concurrent tasks.
+- **W1–W7 (Cancellation)**: waking `pause`, `recv`, `run` (including child process groups), `read-line-from`, grace-period interrupt fallback, `stuck` signalling under `without-interrupts`, and `shielded` cleanup.
+- **P1–P8 (Parking)**: freezing a task while siblings finish, in-thread inspection with `ask`, live function redefinition + `retry`, `give-up`, scope timeout cancelling parked tasks, invalid restart diagnostics via `task-note`, multiple parked tasks, and `:restarts nil`.
+- **Thread leak check**: verifies every test returns with zero leaked SBCL threads.
 
-- **`cancelled` is a `condition`, not an `error`.** `ignore-errors` and a `handler-case` for `error` in a task's
-  code do not swallow it.
-- **`(shielded body...)`** runs cleanup that must finish outside every scope's cancellation.
-- **Last resort.** A task that reaches no wait within `:grace` seconds (default 1) of a cancellation is
-  interrupted. One that cannot be interrupted keeps its scope open, and the scope signals `stuck` every grace
-  period until it ends.
+---
 
-## Parked tasks
+## Known Limitations
 
-With `:on-failure :park`, a task whose code signals an `error` stops where the error was signalled. Its thread, its
-stack and its dynamic bindings stay as they are, and the scope's other tasks go on.
+- **SBCL only**: relies directly on `sb-thread`, `sb-ext`, `sb-bsd-sockets`, and `sb-debug`.
+- **Mutex waits**: a thread blocked acquiring a plain mutex (rather than `wait-on`) is only stopped once the grace-period interrupt fires.
+- **Asynchronous interrupt fallback**: the grace-period `sb-thread:interrupt-thread` fallback can land inside arbitrary cleanup code; always prefer waker-backed waits where possible.
+- **Foreign blocking calls**: CFFI / foreign blocking calls require a custom waker via `call-with-waker`.
+- **OS threads**: each task uses a real SBCL OS thread (tested up to 200 concurrent tasks). Parked tasks keep their thread alive until answered or cancelled.
 
-| | |
-|---|---|
-| `(parked scope)` | the scope's parked tasks |
-| `(task-condition task)`, `(task-report task)`, `(task-restarts task)` | what was signalled, the stack, the restart names on offer |
-| `(answer task restart &rest args)` | have the task invoke the restart, in its own thread |
-| `(ask task thunk &key timeout)` | call `thunk` in the task's thread, where it stopped; its values |
-| `*on-park*` | called with the task, in its thread, when it parks |
-| `(task-note task)` | why the last answer did nothing: an unknown restart, or wrong arguments |
+---
 
-Every task offers `retry` (run the task again from its start), `give-up` (end it as failed) and `finish-with`
-(end it with the given values), beside the restarts its own code establishes. A function redefined while a task
-is parked is the one `retry` runs.
+## Related Work
 
-A parked task holds its thread until it is answered or its scope is cancelled.
-
-## Limits
-
-- **A wait for a lock** is ended only by the interrupt.
-- **The interrupt is asynchronous.** It can land in a cleanup form and cut it short. Nothing here measures how
-  often that corrupts state.
-- **Tested to 200 threads.**
-- **A blocking call in foreign code** needs a waker of its own.
-
-## Related work
-
-Read from their READMEs; neither was run here.
-
-- **[cl-cancel](https://github.com/atgreen/cl-cancel)** has hierarchical cancellation, deadlines, and closing a
-  stream to end a blocked read. It covers what the token and the wakers do here. It has no scope: nothing joins
-  the tasks, and a failure cancels no sibling.
-- **bordeaux-threads** is a portability layer over what `sb-thread` gives. Porting this library to another
-  implementation would start there.
-- Continuation-passing libraries (`cl-cont`, `green-threads`, `blackbird`) turn a task into a chain of closures.
-  A parked task here is a real stack, which is what a backtrace, a restart and `ask` need.
+- **[cl-cancel](https://github.com/atgreen/cl-cancel)**: provides hierarchical cancellation tokens, deadlines, and stream-closing cancellation, but no task scopes (no structured join or sibling cancellation on failure).
+- **[bordeaux-threads](https://sionescu.github.io/bordeaux-threads/)**: portable thread abstraction layer across CL implementations (a natural starting point if porting `cl-scope` beyond SBCL).
+- **CPS / green-thread libraries** (`cl-cont`, `green-threads`, `blackbird`): rewrite tasks into closure chains; `cl-scope` intentionally uses real SBCL threads so parked tasks retain genuine call stacks for backtraces, `ask`, and Common Lisp restarts.
