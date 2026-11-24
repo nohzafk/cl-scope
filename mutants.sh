@@ -55,6 +55,8 @@ mutant "direct CANCEL-SCOPE during JOIN returns body values" \
   's/\(:cancelled\n\s*nil\)/(:cancelled (values-list values))/'
 mutant "JOIN ignores stuck :parked tasks" \
   's/\(member \(task-state task\) \x27\(:running :parked\)\)/(eq (task-state task) :running)/'
+mutant "*ON-PARK* is not inherited by spawned tasks" \
+  's/\(adjoin \x27\*on-park\* \(adjoin \x27\*inherit\* \*inherit\*\)\)/(adjoin \x27*inherit* *inherit*)/'
 
 [ $survived -eq 0 ] && echo "every mutant caught"
 exit $survived

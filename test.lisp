@@ -213,6 +213,24 @@
         (and (typep c 'error) cleaned (< took 500))
         (format nil "~d ms, ~a, cleaned ~a" took c cleaned))))
 
+(deftest "S13"
+  (let* ((printed '())
+         (ready (make-chan)))
+    (with-scope (s :name "demo")
+      (let ((task (spawn (lambda () (send ready t) (pause 5)) :name "worker")))
+        (recv ready)
+        ;; While the task waits, the scope token holds a waker cell referencing the token.
+        (let ((*print-circle* nil))
+          (setf printed (list (prin1-to-string s)
+                              (prin1-to-string task)
+                              (prin1-to-string (sc::scope-token s)))))
+        (cancel-scope s)))
+    (ok "S13 printing a live scope, task, or token never recurses infinitely with *PRINT-CIRCLE* nil"
+        (and (search "demo" (first printed))
+             (search "worker" (second printed))
+             (search "active" (third printed)))
+        (format nil "~s" printed))))
+
 ;;; ---- W: which waits a cancellation ends ----
 
 (defun cancelled-after (seconds thunk &key (grace 1))
@@ -501,14 +519,27 @@
 
 (deftest "P9"
   (let* ((c nil) (task nil)
-         (took (let ((*on-park* (lambda (tk) (declare (ignore tk)) (sleep 2)))
-                     (*inherit* (adjoin '*on-park* *inherit*)))
+         (took (let ((*on-park* (lambda (tk) (declare (ignore tk)) (sleep 2))))
                  (ms (setf c (caught
                                (with-scope (s :on-failure :park :timeout 0.15 :grace 0.2)
                                  (setf task (spawn (lambda () (fetch 3)))))))))))
     (ok "P9 a parked task stuck in *ON-PARK* is still interrupted after the grace period"
         (and (typep c 'timed-out) (eq (task-state task) :cancelled) (<= 300 took 800))
         (format nil "~d ms, ~a, ~a" took c (and task (task-state task))))))
+
+(deftest "P10"
+  (let* ((local-parks (make-chan))
+         (sup (sb-thread:make-thread
+               (lambda ()
+                 (multiple-value-bind (task got) (recv local-parks :timeout 2)
+                   (when got (answer task 'use-value :local-ok))))))
+         (r (let ((*on-park* (lambda (task) (send local-parks task))))
+              (gather (list (lambda () (first (gather (list (lambda () (fetch 3))) :on-failure :park))))
+                      :on-failure :park :timeout 2))))
+    (sb-thread:join-thread sup)
+    (ok "P10 a dynamically let-bound *ON-PARK* is inherited automatically by spawned and nested tasks"
+        (equal r '(:local-ok))
+        (format nil "~s" r))))
 
 (defun run-all ()
   "Run every check, print one line each and the totals. True when none failed."

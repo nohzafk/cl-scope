@@ -98,7 +98,7 @@ Instead of cancelling siblings and losing in-flight work on an unexpected error,
 - **Closed on exit**: once a scope finishes joining, spawning into it signals an error. Calling `spawn` outside any scope is also an error.
 - **Body errors**: if the body of `with-scope` exits via a non-local transfer or error, all child tasks are cancelled and joined before the body's error propagates.
 - **Nesting**: scopes form a tree of cancellation tokens. Cancelling an outer scope cascades to all inner scopes; inner tasks unwind and finish before their parent task exits.
-- **Dynamic bindings (`*inherit*`)**: spawned threads do not blindly copy all thread-local bindings. Only special variables listed in `sc:*inherit*` (plus `*inherit*` itself) are captured at `spawn` time and bound in the child thread.
+- **Dynamic bindings (`*inherit*`)**: spawned threads do not blindly copy all thread-local bindings. Only special variables listed in `sc:*inherit*` (plus `*inherit*` and `*on-park*`) are captured at `spawn` time and bound in the child thread.
 
 ### 2. Cooperative Cancellation
 Cancellation in `cl-scope` is **cooperative first, preemptive only as a last resort**:
@@ -268,11 +268,11 @@ git cl-scope https://github.com/nohzafk/cl-scope.git
 
 ## Testing
 
-Run the full check suite (30 checks, ~6 seconds) or the mutation suite (11 mutants, ~2 minutes):
+Run the full check suite (32 checks, ~6 seconds) or the mutation suite (12 mutants, ~2 minutes):
 
 ```sh
 ./check.sh        # -v prints measured timings and diagnostics
-./mutants.sh      # removes 11 core behaviours one by one and verifies each fails a check
+./mutants.sh      # removes 12 core behaviours one by one and verifies each fails a check
 ```
 
 Or from Lisp via ASDF:
@@ -282,9 +282,9 @@ Or from Lisp via ASDF:
 ```
 
 The test suite (`test.lisp`) covers:
-- **S1–S12 (Scopes)**: join semantics, sibling cancellation on failure, body errors, nested inner-first unwind, timeouts, closed-scope rejection, `gather` ordering, `*inherit*`, 200 concurrent tasks, outer cancellation during `join` / pre-cancelled entry, direct `cancel-scope` during `join`, and failed `spawn` cleanup.
+- **S1–S13 (Scopes)**: join semantics, sibling cancellation on failure, body errors, nested inner-first unwind, timeouts, closed-scope rejection, `gather` ordering, `*inherit*`, 200 concurrent tasks, outer cancellation during `join` / pre-cancelled entry, direct `cancel-scope` during `join`, failed `spawn` cleanup, and cycle-safe REPL printing.
 - **W1–W8 (Cancellation)**: waking `pause`, `recv`, `run` (including child process groups), `read-line-from`, grace-period interrupt fallback, `stuck` signalling under `without-interrupts`, `shielded` cleanup, and failing-waker isolation.
-- **P1–P9 (Parking)**: freezing a task while siblings finish, in-thread inspection with `ask`, live function redefinition + `retry`, `give-up`, scope timeout cancelling parked tasks, invalid restart diagnostics via `task-note`, multiple parked tasks, `:restarts nil`, and interrupting a parked task stuck in `*on-park*`.
+- **P1–P10 (Parking)**: freezing a task while siblings finish, in-thread inspection with `ask`, live function redefinition + `retry`, `give-up`, scope timeout cancelling parked tasks, invalid restart diagnostics via `task-note`, multiple parked tasks, `:restarts nil`, interrupting a parked task stuck in `*on-park*`, and automatic inheritance of dynamically bound `*on-park*`.
 - **Thread leak check**: verifies every test returns with zero leaked SBCL threads.
 
 ---

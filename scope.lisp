@@ -51,6 +51,12 @@
   (children '())
   (wakers '()))
 
+(defmethod print-object ((token token) stream)
+  (print-unreadable-object (token stream :type t :identity t)
+    (if (token-reason token)
+        (format stream "cancelled ~s" (token-reason token))
+        (write-string "active" stream))))
+
 (defvar *token* nil "The token of the scope this thread runs in; nil outside any scope.")
 
 (defun make-token (&optional (parent *token*))
@@ -215,6 +221,10 @@ and its process group when it leads one."
   (timeout nil)
   (grace 1))
 
+(defmethod print-object ((scope scope) stream)
+  (print-unreadable-object (scope stream :type t :identity t)
+    (format stream "~s ~a ~d live" (scope-name scope) (scope-state scope) (scope-live scope))))
+
 (defstruct (task (:constructor %make-task))
   name scope fn thread bindings
   (own-restarts t)     ; nil: the task offers no RETRY, GIVE-UP or FINISH-WITH of its own
@@ -222,6 +232,10 @@ and its process group when it leads one."
   (values '())
   condition report restarts note
   (inbox (make-chan))) ; where a parked task takes its answers
+
+(defmethod print-object ((task task) stream)
+  (print-unreadable-object (task stream :type t :identity t)
+    (format stream "~s ~a" (task-name task) (task-state task))))
 
 (defun task-live-p (task)
   "True while TASK has not reached a terminal state (:done, :failed, or :cancelled)."
@@ -360,7 +374,7 @@ nil the task offers no RETRY, GIVE-UP or FINISH-WITH: a parked one is answered
 only with the restarts its own code establishes."
   (unless scope (error "SPAWN needs a scope: call it inside WITH-SCOPE, or pass :scope."))
   (let ((task (%make-task :fn fn :scope scope :own-restarts restarts
-                          :bindings (loop for s in (adjoin '*inherit* *inherit*)
+                          :bindings (loop for s in (adjoin '*on-park* (adjoin '*inherit* *inherit*))
                                           when (boundp s) collect (cons s (symbol-value s))))))
     (locked ((scope-lock scope))
       (when (eq (scope-state scope) :closed)
