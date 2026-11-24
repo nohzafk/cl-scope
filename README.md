@@ -290,7 +290,7 @@ The test suite (`test.lisp`) covers:
 
 ## Known Limitations
 
-- **SBCL only**: relies directly on `sb-thread`, `sb-ext` (timers), and `sb-debug`. The tests also use `sb-bsd-sockets` and `sb-ext:run-program`.
+- **SBCL only, by design**: relies directly on `sb-thread`, `sb-ext` (timers), and `sb-debug`. The tests also use `sb-bsd-sockets` and `sb-ext:run-program`. bordeaux-threads would add a dependency without porting what matters: interrupt delivery, timers, backtraces.
 - **Mutex waits**: a thread blocked acquiring a plain mutex (rather than `wait-on`) is only stopped once the grace-period interrupt fires.
 - **Asynchronous interrupt fallback**: the grace-period `sb-thread:interrupt-thread` fallback can land inside arbitrary cleanup code; always prefer waker-backed waits where possible.
 - **Foreign blocking calls**: CFFI / foreign blocking calls require a custom waker via `call-with-waker`.
