@@ -4,9 +4,6 @@
 ;;; cancels its scope or parks with its stack, to be answered with a restart
 ;;; from another thread.
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (require :sb-bsd-sockets))
-
 (defpackage #:cl-scope
   (:nicknames #:sc)
   (:use #:cl)
@@ -14,7 +11,7 @@
            #:cancelled #:cancelled-reason #:task-error #:task-error-task #:task-error-condition
            #:timed-out #:stuck #:stuck-tasks
            #:check #:shielded #:call-with-waker #:wait-on
-           #:pause #:make-chan #:send #:recv #:run #:read-line-from
+           #:pause #:make-chan #:send #:recv
            #:task-name #:task-state #:task-values #:task-condition #:task-report #:task-restarts
            #:task-note #:task-thread #:task-scope #:scope-tasks #:scope-name
            #:parked #:answer #:ask #:retry #:give-up #:finish-with
@@ -172,35 +169,6 @@ THUNK returned or signalled."
            (check token)
            (multiple-value-prog1 (funcall thunk) (check token)))
       (when cell (remove-waker token cell)))))
-
-(defun stop-process (process signal)
-  (when (sb-ext:process-alive-p process)
-    (ignore-errors (sb-ext:process-kill process signal :process-group))
-    (ignore-errors (sb-ext:process-kill process signal :pid))))
-
-(defun run (program args &key search)
-  "Run PROGRAM with ARGS; its output as a string, and its exit code. Pass
-:SEARCH t to resolve PROGRAM via $PATH. A cancellation terminates the process,
-and its process group when it leads one."
-  (let ((p (sb-ext:run-program program args :wait nil :search search :input nil :output :stream :error :output)))
-    (unwind-protect
-         (call-with-waker
-          (lambda () (stop-process p 15))
-          (lambda ()
-            (let ((out (with-output-to-string (s)
-                         (loop for line = (read-line (sb-ext:process-output p) nil)
-                               while line do (write-line line s)))))
-              (loop while (sb-ext:process-alive-p p) do (pause 0.002))
-              (values out (sb-ext:process-exit-code p)))))
-      (stop-process p 9)
-      (loop repeat 500 while (sb-ext:process-alive-p p) do (sleep 0.002))
-      (sb-ext:process-close p))))
-
-(defun read-line-from (socket stream)
-  "A line from STREAM, the stream of SOCKET, or :eof. A cancellation shuts the socket down."
-  (call-with-waker
-   (lambda () (ignore-errors (sb-bsd-sockets:socket-shutdown socket :direction :io)))
-   (lambda () (read-line stream nil :eof))))
 
 ;;; ---- scopes and tasks ----
 

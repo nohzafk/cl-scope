@@ -8,12 +8,11 @@
   :homepage "https://github.com/nohzafk/cl-scope"
   :bug-tracker "https://github.com/nohzafk/cl-scope/issues"
   :source-control (:git "https://github.com/nohzafk/cl-scope.git")
-  :depends-on ((:require "sb-bsd-sockets"))
   :components ((:file "scope"))
   :in-order-to ((test-op (test-op "cl-scope/test"))))
 
 (defsystem "cl-scope/test"
-  :depends-on ("cl-scope")
+  :depends-on ("cl-scope" (:require "sb-bsd-sockets"))
   :components ((:file "test"))
   :perform (test-op (o c)
              (unless (uiop:symbol-call :cl-scope/test :run-all)

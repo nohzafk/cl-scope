@@ -21,7 +21,7 @@ mutant() {
   fi
   # SBCL handles SIGALRM itself, so the limit is a watcher that kills the run.
   (cd "$D" && exec "$SBCL" --noinform --non-interactive --no-sysinit --no-userinit \
-    --load scope.lisp --load test.lisp --eval '(sb-ext:exit :code (if (cl-scope/test:run-all) 0 1) :abort t)') > "$D/out" 2>&1 &
+    --load scope.lisp --eval '(require :sb-bsd-sockets)' --load test.lisp --eval '(sb-ext:exit :code (if (cl-scope/test:run-all) 0 1) :abort t)') > "$D/out" 2>&1 &
   run=$!
   (sleep "$LIMIT"; kill -9 $run 2>/dev/null) &
   watch=$!
@@ -43,8 +43,6 @@ mutant "a task whose restart returned is marked running while it waits" \
   's/;; Here only when the restart returned or failed: the task is where it was.\n\s*\(set-state task :parked\)//'
 mutant "SHIELDED shields nothing" \
   's/\(let \(\(\*token\* nil\)\) ,\@body\)/(progn ,\@body)/'
-mutant "a cancelled RUN signals only the process, not its group" \
-  's/\(ignore-errors \(sb-ext:process-kill process signal :process-group\)\)//'
 mutant "CANCEL calls no waker" \
   's/\(dolist \(w wakers\) \(ignore-errors \(funcall \(cdr w\)\)\)\)/(progn wakers)/'
 mutant "a failing waker aborts remaining wakers and child cancellation" \

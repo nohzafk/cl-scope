@@ -240,6 +240,38 @@
                              (setf task (spawn thunk)))))))
     (values (- took (round (* 1000 seconds))) task)))
 
+;;; Blocking operations cl-scope does not wrap, made cancellable with
+;;; CALL-WITH-WAKER: the W checks wait on them.
+
+(defun stop-process (process signal)
+  (when (sb-ext:process-alive-p process)
+    (ignore-errors (sb-ext:process-kill process signal :process-group))
+    (ignore-errors (sb-ext:process-kill process signal :pid))))
+
+(defun run (program args &key search)
+  "Run PROGRAM with ARGS; its output as a string, and its exit code. Pass
+:SEARCH t to resolve PROGRAM via $PATH. A cancellation terminates the process,
+and its process group when it leads one."
+  (let ((p (sb-ext:run-program program args :wait nil :search search :input nil :output :stream :error :output)))
+    (unwind-protect
+         (call-with-waker
+          (lambda () (stop-process p 15))
+          (lambda ()
+            (let ((out (with-output-to-string (s)
+                         (loop for line = (read-line (sb-ext:process-output p) nil)
+                               while line do (write-line line s)))))
+              (loop while (sb-ext:process-alive-p p) do (pause 0.002))
+              (values out (sb-ext:process-exit-code p)))))
+      (stop-process p 9)
+      (loop repeat 500 while (sb-ext:process-alive-p p) do (sleep 0.002))
+      (sb-ext:process-close p))))
+
+(defun read-line-from (socket stream)
+  "A line from STREAM, the stream of SOCKET, or :eof. A cancellation shuts the socket down."
+  (call-with-waker
+   (lambda () (ignore-errors (sb-bsd-sockets:socket-shutdown socket :direction :io)))
+   (lambda () (read-line stream nil :eof))))
+
 (defun no-process-p (pattern)
   (/= 0 (nth-value 1 (shielded (run "pgrep" (list "-f" pattern) :search t)))))
 
