@@ -174,7 +174,7 @@
     (values (- took (round (* 1000 seconds))) task)))
 
 (defun no-process-p (pattern)
-  (/= 0 (nth-value 1 (shielded (run "/usr/bin/pgrep" (list "-f" pattern))))))
+  (/= 0 (nth-value 1 (shielded (run "pgrep" (list "-f" pattern) :search t)))))
 
 (deftest "W1"
   (multiple-value-bind (late task) (cancelled-after 0.2 (lambda () (pause 30)))

@@ -124,18 +124,29 @@ during the wait and TEST has no value."
 (defstruct (chan (:constructor make-chan ()))
   (lock (sb-thread:make-mutex :name "chan"))
   (queue (sb-thread:make-waitqueue))
-  (items '()))
+  (items '())
+  (tail nil))
 
 (defun send (chan x)
-  (locked ((chan-lock chan))
-    (setf (chan-items chan) (nconc (chan-items chan) (list x)))
-    (sb-thread:condition-broadcast (chan-queue chan)))
+  (let ((cell (list x)))
+    (locked ((chan-lock chan))
+      (if (chan-tail chan)
+          (setf (cdr (chan-tail chan)) cell
+                (chan-tail chan) cell)
+          (setf (chan-items chan) cell
+                (chan-tail chan) cell))
+      (sb-thread:condition-broadcast (chan-queue chan))))
   x)
 
 (defun recv (chan &key timeout)
   "The next item of CHAN and t; nil and nil when TIMEOUT seconds pass first."
   (let ((got (wait-on (chan-lock chan) (chan-queue chan)
-                      (lambda () (when (chan-items chan) (list (pop (chan-items chan)))))
+                      (lambda ()
+                        (when (chan-items chan)
+                          (let ((item (pop (chan-items chan))))
+                            (unless (chan-items chan)
+                              (setf (chan-tail chan) nil))
+                            (list item))))
                       :timeout timeout)))
     (if got (values (car got) t) (values nil nil))))
 
@@ -161,10 +172,11 @@ THUNK returned or signalled."
     (ignore-errors (sb-ext:process-kill process signal :process-group))
     (ignore-errors (sb-ext:process-kill process signal :pid))))
 
-(defun run (program args)
-  "Run PROGRAM with ARGS; its output as a string, and its exit code. A
-cancellation terminates the process, and its process group when it leads one."
-  (let ((p (sb-ext:run-program program args :wait nil :input nil :output :stream :error :output)))
+(defun run (program args &key search)
+  "Run PROGRAM with ARGS; its output as a string, and its exit code. Pass
+:SEARCH t to resolve PROGRAM via $PATH. A cancellation terminates the process,
+and its process group when it leads one."
+  (let ((p (sb-ext:run-program program args :wait nil :search search :input nil :output :stream :error :output)))
     (unwind-protect
          (call-with-waker
           (lambda () (stop-process p 15))
@@ -237,7 +249,7 @@ cancellation terminates the process, and its process group when it leads one."
 (defun stack-lines (&optional (count 8))
   "The frames of this thread between the signalling call and the task's own start."
   (let* ((text (with-output-to-string (s)
-                 (let ((*print-length* 6) (*print-level* 3))
+                 (let ((*package* (find-package :cl)) (*print-length* 6) (*print-level* 3))
                    (sb-debug:print-backtrace :stream s :count 60))))
          (lines (loop with start = 0
                       for end = (position #\Newline text :start start)
