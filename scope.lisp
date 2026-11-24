@@ -78,7 +78,7 @@
             (token-reason token) reason)
       (shiftf wakers (token-wakers token) '())
       (shiftf children (token-children token) '()))
-    (dolist (w wakers) (funcall (cdr w)))
+    (dolist (w wakers) (ignore-errors (funcall (cdr w))))
     (dolist (c children) (cancel c reason origin))
     t))
 
@@ -208,19 +208,24 @@ and its process group when it leads one."
   (lock (sb-thread:make-mutex :name "scope"))
   (queue (sb-thread:make-waitqueue))
   (tasks '())
-  (live 0)             ; tasks whose thread has not finished
+  (live 0)             ; tasks in a live state (:running or :parked)
   (failure nil)        ; the first task that failed
-  (closed nil)
+  (state :open)        ; :open :grace :interrupted :stuck :closed
   (on-failure :cancel) ; :cancel, or :park
+  (timeout nil)
   (grace 1))
 
 (defstruct (task (:constructor %make-task))
   name scope fn thread bindings
   (own-restarts t)     ; nil: the task offers no RETRY, GIVE-UP or FINISH-WITH of its own
-  (state :running)     ; :running :parked :done :failed :cancelled
+  (state :running)     ; live: :running :parked | terminal: :done :failed :cancelled
   (values '())
   condition report restarts note
   (inbox (make-chan))) ; where a parked task takes its answers
+
+(defun task-live-p (task)
+  "True while TASK has not reached a terminal state (:done, :failed, or :cancelled)."
+  (member (task-state task) '(:running :parked)))
 
 (define-condition task-error (error)
   ((task :initarg :task :reader task-error-task)
@@ -304,6 +309,7 @@ Returns only by a restart's transfer, or by a cancellation."
     (when first (cancel (scope-token scope) (list :failed (task-name task))))))
 
 (defun run-task (task)
+  (setf (task-thread task) sb-thread:*current-thread*)
   (let* ((scope (task-scope task))
          (*scope* scope)
          (*token* (scope-token scope))
@@ -357,14 +363,15 @@ only with the restarts its own code establishes."
                           :bindings (loop for s in (adjoin '*inherit* *inherit*)
                                           when (boundp s) collect (cons s (symbol-value s))))))
     (locked ((scope-lock scope))
-      (when (scope-closed scope)
+      (when (eq (scope-state scope) :closed)
         (error "scope ~a has ended; it takes no new task" (scope-name scope)))
-      (setf (task-name task)
-            (or name (format nil "~a/~d" (or (scope-name scope) "scope") (length (scope-tasks scope)))))
-      (push task (scope-tasks scope))
-      (incf (scope-live scope)))
-    (setf (task-thread task)
-          (sb-thread:make-thread #'run-task :arguments (list task) :name (task-name task)))
+      ;; Create the thread before recording the task so no half-born task (live
+      ;; without a thread) is ever visible to JOIN or leaked if MAKE-THREAD fails.
+      (let ((task-name (or name (format nil "~a/~d" (or (scope-name scope) "scope") (length (scope-tasks scope))))))
+        (setf (task-name task) task-name
+              (task-thread task) (sb-thread:make-thread #'run-task :arguments (list task) :name task-name))
+        (push task (scope-tasks scope))
+        (incf (scope-live scope))))
     task))
 
 (defun interrupt (task)
@@ -375,71 +382,104 @@ only with the restarts its own code establishes."
        (sb-thread:interrupt-thread
         thread (lambda () (unless *joining* (error 'cancelled :reason :interrupted))))))))
 
+(defun live-tasks (scope)
+  (remove-if-not #'task-live-p (scope-tasks scope)))
+
 (defun join (scope)
-  "Wait until every task of SCOPE has finished. Once the scope is cancelled, a
-task still running after one grace period is interrupted, and after each
-further one STUCK is signalled."
+  "Wait until every task of SCOPE has finished. Once cancelled, transitions
+SCOPE through :grace -> :interrupted -> :stuck -> :closed."
   (let* ((token (scope-token scope))
          (lock (scope-lock scope))
          (queue (scope-queue scope))
          (grace (scope-grace scope))
          (cell (add-waker token (lambda () (locked (lock) (sb-thread:condition-broadcast queue)))))
-         (since nil)
-         (stage 0))
+         (deadline nil))
     (unwind-protect
          (loop
-           (let ((late '()))
+           (let ((action nil) (late '()))
              (locked (lock)
                (when (zerop (scope-live scope))
-                 (setf (scope-closed scope) t)
+                 (setf (scope-state scope) :closed)
                  (return))
-               (if (null (token-reason token))
-                   (sb-thread:condition-wait queue lock)
-                   (progn
-                     (unless since (setf since (now)))
-                     (let ((due (+ since (* grace (1+ stage)))))
-                       (if (< (now) due)
-                           (sb-thread:condition-wait queue lock :timeout (float (- due (now)) 1d0))
-                           (setf stage (1+ stage)
-                                 late (remove :running (scope-tasks scope) :key #'task-state :test-not #'eq)))))))
+               (ecase (scope-state scope)
+                 (:open
+                  (if (token-reason token)
+                      (setf (scope-state scope) :grace
+                            deadline (+ (now) grace))
+                      (sb-thread:condition-wait queue lock)))
+                 (:grace
+                  (let ((left (- deadline (now))))
+                    (if (plusp left)
+                        (sb-thread:condition-wait queue lock :timeout (float left 1d0))
+                        (setf (scope-state scope) :interrupted
+                              deadline (+ (now) grace)
+                              action :interrupt
+                              late (live-tasks scope)))))
+                 ((:interrupted :stuck)
+                  (let ((left (- deadline (now))))
+                    (if (plusp left)
+                        (sb-thread:condition-wait queue lock :timeout (float left 1d0))
+                        (setf (scope-state scope) :stuck
+                              deadline (+ (now) grace)
+                              action :stuck
+                              late (live-tasks scope)))))))
              (when late
-               (if (= stage 1)
-                   (mapc #'interrupt late)
-                   (signal 'stuck :scope scope :tasks late)))))
+               (case action
+                 (:interrupt (mapc #'interrupt late))
+                 (:stuck (signal 'stuck :scope scope :tasks late))))))
       (when cell (remove-waker token cell))))
   (dolist (task (scope-tasks scope))
     (when (task-thread task) (sb-thread:join-thread (task-thread task) :default nil))))
 
+(defun scope-outcome (scope)
+  "The final outcome of a closed SCOPE: :failed, :timed-out, :outer-cancelled,
+:cancelled, or :completed."
+  (let* ((token (scope-token scope))
+         (reason (token-reason token))
+         (own (eq (token-origin token) token)))
+    (cond ((scope-failure scope) :failed)
+          ((null reason) :completed)
+          ((not own) :outer-cancelled)
+          ((and (eq reason :timeout) (scope-timeout scope)) :timed-out)
+          (t :cancelled))))
+
 (defun call-with-scope (fn &key name (on-failure :cancel) timeout (grace 1))
+  (check *token*)
   (let* ((token (make-token *token*))
-         (scope (%make-scope :name name :token token :on-failure on-failure :grace grace))
+         (scope (%make-scope :name name :token token :on-failure on-failure :timeout timeout :grace grace))
          (timer (and timeout
                      (sb-ext:make-timer (lambda () (cancel token :timeout)) :thread t :name "scope time limit")))
-         (ok nil)
+         (body-settled nil)
          (values '()))
-    (when timer (sb-ext:schedule-timer timer timeout))
     (unwind-protect
-         (handler-case
-             (let ((*scope* scope) (*token* token))
-               (setf values (multiple-value-list (funcall fn scope))
-                     ok t))
-           (cancelled (c)
-             ;; A cancellation that began at this scope ends here; one from outside goes on.
-             (if (eq (token-origin token) token)
-                 (setf ok :own)
-                 (error c))))
+         (progn
+           (when timer (sb-ext:schedule-timer timer timeout))
+           (handler-case
+               (let ((*scope* scope) (*token* token))
+                 (setf values (multiple-value-list (funcall fn scope))
+                       body-settled t))
+             (cancelled (c)
+               ;; A cancellation that began at this scope ends here; one from outside unwinds on.
+               (if (eq (token-origin token) token)
+                   (setf body-settled t)
+                   (error c)))))
       (let ((*joining* t))
-        (unless ok (cancel token :scope-exit))
+        (unless body-settled (cancel token :scope-exit))
         (join scope)
         (when timer (sb-ext:unschedule-timer timer))
         (drop-token token)))
-    (let ((failed (scope-failure scope)))
-      (cond (failed
-             (error 'task-error :task failed :condition (task-condition failed)))
-            ((and (eq (token-reason token) :timeout) (eq (token-origin token) token))
-             (error 'timed-out :scope scope :seconds timeout))
-            ((eq ok :own) nil)
-            (t (values-list values))))))
+    (ecase (scope-outcome scope)
+      (:failed
+       (let ((failed (scope-failure scope)))
+         (error 'task-error :task failed :condition (task-condition failed))))
+      (:timed-out
+       (error 'timed-out :scope scope :seconds timeout))
+      (:outer-cancelled
+       (check token))
+      (:cancelled
+       nil)
+      (:completed
+       (values-list values)))))
 
 (defmacro with-scope ((var &rest options &key name on-failure timeout grace) &body body)
   "Evaluate BODY with VAR bound to a new scope, and return only when every task

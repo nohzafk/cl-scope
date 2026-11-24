@@ -164,6 +164,55 @@
         (and (= (reduce #'+ r) n) (< all 1000) (typep c 'timed-out) (< cut 400))
         (format nil "~d ms, ~d ms" all cut))))
 
+(deftest "S10"
+  (let* ((after-gather :not-reached)
+         (after-inner :not-reached)
+         (ran-when-cancelled nil)
+         (c1 (caught
+               (with-scope (outer :timeout 0.1)
+                 (let ((r (gather (list (lambda () (pause 5) :a) (lambda () (pause 5) :b)))))
+                   (setf after-gather r)))))
+         (c2 (caught
+               (with-scope (outer :timeout 0.1)
+                 (let ((r (with-scope (inner)
+                            (spawn (lambda () (pause 5)))
+                            :body-done)))
+                   (setf after-inner r)))))
+         (c3 (caught
+               (with-scope (outer)
+                 (cancel-scope outer :stop)
+                 (with-scope (inner)
+                   (setf ran-when-cancelled t))))))
+    (ok "S10 an outer cancellation during JOIN (or before entry) signals CANCELLED instead of returning"
+        (and (typep c1 'timed-out) (eq after-gather :not-reached)
+             (typep c2 'timed-out) (eq after-inner :not-reached)
+             (null c3) (null ran-when-cancelled))
+        (format nil "gather ~a/~s, inner ~a/~s, pre-cancelled ~a/~a"
+                c1 after-gather c2 after-inner c3 ran-when-cancelled))))
+
+(deftest "S11"
+  (let* ((sleeper nil)
+         (r1 (with-scope (s)
+               (setf sleeper (spawn (lambda () (pause 5))))
+               (spawn (lambda () (pause 0.05) (cancel-scope s)))
+               :body-value))
+         (r2 (with-scope (s)
+               (spawn (lambda () (pause 0.05) (cancel-scope s :timeout)))
+               :body-value)))
+    (ok "S11 a direct CANCEL-SCOPE during JOIN returns NIL (and never signals TIMED-OUT without :timeout)"
+        (and (null r1) (eq (task-state sleeper) :cancelled) (null r2))
+        (format nil "r1 ~s (~a), r2 ~s" r1 (and sleeper (task-state sleeper)) r2))))
+
+(deftest "S12"
+  (let* ((cleaned nil) (c nil)
+         (took (ms (setf c (caught
+                             (with-scope (s :grace 0.2)
+                               (spawn (lambda () (unwind-protect (pause 5) (setf cleaned t))))
+                               (spawn (lambda () :never) :name 123)))))))
+    (ok "S12 a failed SPAWN leaves no phantom live task behind and does not wedge JOIN"
+        (and (typep c 'error) cleaned (< took 500))
+        (format nil "~d ms, ~a, cleaned ~a" took c cleaned))))
+
 ;;; ---- W: which waits a cancellation ends ----
 
 (defun cancelled-after (seconds thunk &key (grace 1))
@@ -266,6 +315,34 @@
     (ok "W7 a wait in a cleanup form is cancelled too, unless it is SHIELDED; the scope waits for the shielded one"
         (and (equal (reverse trace) '(:cut :shielded-finished)) (<= 190 took 500))
         (format nil "~d ms, ~s" took (reverse trace)))))
+
+(deftest "W8"
+  (let* ((woken nil) (child-cancelled nil) (ready (make-chan)) (c nil)
+         (took (ms (setf c (caught
+                             (with-scope (outer :timeout 0.15 :grace 2)
+                               (spawn (lambda ()
+                                        (with-scope (inner)
+                                          (spawn (lambda ()
+                                                   (unwind-protect (pause 2)
+                                                     (setf child-cancelled t))))
+                                          (send ready :child)
+                                          (pause 2))))
+                               (spawn (lambda ()
+                                        (let ((ch (make-chan)))
+                                          (call-with-waker
+                                           (lambda () (setf woken t) (send ch :ok))
+                                           (lambda ()
+                                             (send ready :waker)
+                                             (recv ch :timeout 2))))))
+                               (recv ready)
+                               (recv ready)
+                               ;; Registered last so CANCEL invokes this failing waker first.
+                               (call-with-waker
+                                (lambda () (error "broken waker"))
+                                (lambda () (pause 2)))))))))
+    (ok "W8 a waker that signals an error does not stop other wakers or child scopes from cancelling"
+        (and (typep c 'timed-out) woken child-cancelled (< took 600))
+        (format nil "~d ms, ~a, woken ~a, child ~a" took c woken child-cancelled))))
 
 ;;; ---- P: a failed task parks ----
 
@@ -386,6 +463,24 @@
              (eq (first (first seen)) :parked) (search "the answer failed" (second (first seen))))
         (format nil "~s ~s" r (reverse seen)))))
 
+(deftest "P7"
+  (let* ((count nil)
+         (op (progn
+               (setf *parks* (make-chan))
+               (sb-thread:make-thread
+                (lambda ()
+                  (let ((a (recv *parks* :timeout 5)) (b (recv *parks* :timeout 5)))
+                    (setf count (length (parked (task-scope a))))
+                    (answer b 'use-value (task-name b))
+                    (pause 0.1)
+                    (answer a 'use-value (task-name a)))))))
+         (r (gather (list (lambda () (fetch 3)) (lambda () (fetch 3)) (lambda () (fetch 1)))
+                    :name "pair" :on-failure :park)))
+    (sb-thread:join-thread op)
+    (ok "P7 two tasks parked at once are listed together and answered in any order"
+        (and (equal r '("pair/0" "pair/1" 10)) (eql count 2))
+        (format nil "~s, ~a parked" r count))))
+
 (deftest "P8"
   (let* ((seen '()) (task nil)
          (op (operator (lambda (task)
@@ -404,23 +499,16 @@
              (not (intersection '(retry give-up finish-with) (second seen))))
         (format nil "~s ~s" (task-values task) (reverse seen)))))
 
-(deftest "P7"
-  (let* ((count nil)
-         (op (progn
-               (setf *parks* (make-chan))
-               (sb-thread:make-thread
-                (lambda ()
-                  (let ((a (recv *parks* :timeout 5)) (b (recv *parks* :timeout 5)))
-                    (setf count (length (parked (task-scope a))))
-                    (answer b 'use-value (task-name b))
-                    (pause 0.1)
-                    (answer a 'use-value (task-name a)))))))
-         (r (gather (list (lambda () (fetch 3)) (lambda () (fetch 3)) (lambda () (fetch 1)))
-                    :name "pair" :on-failure :park)))
-    (sb-thread:join-thread op)
-    (ok "P7 two tasks parked at once are listed together and answered in any order"
-        (and (equal r '("pair/0" "pair/1" 10)) (eql count 2))
-        (format nil "~s, ~a parked" r count))))
+(deftest "P9"
+  (let* ((c nil) (task nil)
+         (took (let ((*on-park* (lambda (tk) (declare (ignore tk)) (sleep 2)))
+                     (*inherit* (adjoin '*on-park* *inherit*)))
+                 (ms (setf c (caught
+                               (with-scope (s :on-failure :park :timeout 0.15 :grace 0.2)
+                                 (setf task (spawn (lambda () (fetch 3)))))))))))
+    (ok "P9 a parked task stuck in *ON-PARK* is still interrupted after the grace period"
+        (and (typep c 'timed-out) (eq (task-state task) :cancelled) (<= 300 took 800))
+        (format nil "~d ms, ~a, ~a" took c (and task (task-state task))))))
 
 (defun run-all ()
   "Run every check, print one line each and the totals. True when none failed."

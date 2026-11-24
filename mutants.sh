@@ -27,7 +27,7 @@ mutant() {
   watch=$!
   { wait $run; code=$?; } 2>/dev/null
   kill $watch 2>/dev/null; wait $watch 2>/dev/null
-  failed=$(sed -n 's/^FAIL \([A-Z][0-9]\).*/\1/p' "$D/out" | tr '\n' ' ')
+  failed=$(sed -n 's/^FAIL \([A-Z][0-9][0-9]*\).*/\1/p' "$D/out" | tr '\n' ' ')
   if [ $code -eq 0 ]; then echo "SURVIVED $1"; survived=1
   elif [ $code -eq 137 ]; then echo "caught   $1: the run did not end in $LIMIT s"
   else echo "caught   $1: ${failed:-exit $code}"; fi
@@ -46,7 +46,15 @@ mutant "SHIELDED shields nothing" \
 mutant "a cancelled RUN signals only the process, not its group" \
   's/\(ignore-errors \(sb-ext:process-kill process signal :process-group\)\)//'
 mutant "CANCEL calls no waker" \
-  's/\(dolist \(w wakers\) \(funcall \(cdr w\)\)\)/(progn wakers)/'
+  's/\(dolist \(w wakers\) \(ignore-errors \(funcall \(cdr w\)\)\)\)/(progn wakers)/'
+mutant "a failing waker aborts remaining wakers and child cancellation" \
+  's/\(ignore-errors \(funcall \(cdr w\)\)\)/(funcall (cdr w))/'
+mutant "outer cancellation during JOIN is swallowed" \
+  's/\(:outer-cancelled\n\s*\(check token\)\)/(:outer-cancelled (values-list values))/'
+mutant "direct CANCEL-SCOPE during JOIN returns body values" \
+  's/\(:cancelled\n\s*nil\)/(:cancelled (values-list values))/'
+mutant "JOIN ignores stuck :parked tasks" \
+  's/\(member \(task-state task\) \x27\(:running :parked\)\)/(eq (task-state task) :running)/'
 
 [ $survived -eq 0 ] && echo "every mutant caught"
 exit $survived
