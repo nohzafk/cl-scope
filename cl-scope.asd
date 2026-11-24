@@ -3,6 +3,11 @@
 (defsystem "cl-scope"
   :description "Scopes that join their tasks, cancellation where a task waits, and failed tasks that park with their stack."
   :version "0.1.0"
+  :author "nohzafk"
+  :license "MIT"
+  :homepage "https://github.com/nohzafk/cl-scope"
+  :bug-tracker "https://github.com/nohzafk/cl-scope/issues"
+  :source-control (:git "https://github.com/nohzafk/cl-scope.git")
   :depends-on ((:require "sb-bsd-sockets"))
   :components ((:file "scope"))
   :in-order-to ((test-op (test-op "cl-scope/test"))))
