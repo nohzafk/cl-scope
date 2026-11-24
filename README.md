@@ -37,6 +37,8 @@ Package: `cl-scope` (nickname: `sc`). SBCL only.
 Instead of cancelling siblings and losing in-flight work on an unexpected error, park the failed task in place:
 
 ```lisp
+(defvar *request-id* nil)
+
 (defun compute (x)
   (error "buggy implementation for ~a" x))
 
@@ -46,17 +48,18 @@ Instead of cancelling siblings and losing in-flight work on an unexpected error,
     (sb-thread:make-thread
      (lambda ()
        (let ((task (sc:recv parked-events)))
-         ;; Evaluate code inside the parked task's thread & dynamic bindings:
          (format t "Failed with: ~a~%" (sc:task-condition task))
          (format t "Stack: ~s~%" (sc:task-report task))
          (format t "Restarts: ~s~%" (sc:task-restarts task))
+         ;; Evaluate code inside the parked task's thread & live dynamic bindings:
+         (format t "Request ID: ~s~%" (sc:ask task (lambda () *request-id*)))
 
          ;; Hot-fix the broken function and resume the task in place:
          (defun compute (x) (* x 2))
          (sc:answer task 'sc:retry))))
 
     ;; Sibling tasks keep running while the failed one is parked.
-    (sc:gather (list (lambda () (compute 21))
+    (sc:gather (list (lambda () (let ((*request-id* "req-42")) (compute 21)))
                      (lambda () (sc:pause 0.1) :ok))
                :on-failure :park)))
 ;; => (42 :OK)
@@ -123,6 +126,71 @@ When a scope is created with `:on-failure :park`:
 - **Bad answers stay safe**: passing an unknown restart name, wrong arguments, or invoking a restart that returns without transferring control leaves the task `:parked` and records the reason in `(sc:task-note task)`.
 - **Scope cancellation wins**: if the scope is cancelled or times out while a task is parked, the parked task is woken and unwound cleanly.
 
+### 4. State Machines
+
+`cl-scope` models task execution, scope shutdown, and scope exit resolution as explicit state machines.
+
+#### Task Lifecycle (`task-state`)
+
+Tasks are admitted atomically under `scope-lock` (the OS thread is created before recording the task), so no half-born task is ever visible to `join`. A task is considered **live** (`task-live-p`) while `:running` or `:parked`, and **terminal** once `:done`, `:failed`, or `:cancelled`:
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> running : spawn (atomic under scope-lock)
+
+    state "Live (task-live-p)" as live {
+        running --> parked : error & :on-failure :park
+        parked --> parked : ask / bad answer / returning restart
+        parked --> running : answer invokes restart
+    }
+
+    running --> done : normal return / finish-with
+    running --> failed : error (:cancel) / non-error serious-condition / give-up
+    running --> cancelled : sc:cancelled
+    parked --> cancelled : scope cancelled or timed out
+
+    done --> [*]
+    failed --> [*]
+    cancelled --> [*]
+```
+
+#### Scope Shutdown Lifecycle (`join`)
+
+Once a scope enters `join`, it transitions monotonically through explicit shutdown phases until `live = 0`, then joins every OS thread before returning:
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> open : with-scope (checks enclosing token on entry)
+
+    open --> closed : live = 0
+    open --> grace : token cancelled
+
+    grace --> closed : live = 0
+    grace --> interrupted : grace expired / interrupt live tasks
+
+    interrupted --> closed : live = 0
+    interrupted --> stuck : grace expired / signal sc:stuck
+
+    stuck --> closed : live = 0
+    stuck --> stuck : grace expired / signal sc:stuck
+
+    closed --> [*] : join OS threads & resolve outcome
+```
+
+#### Scope Exit Outcome (`scope-outcome`)
+
+If the body of `with-scope` unwinds via an error, non-local transfer, or outer cancellation, the scope cancels its tasks (`:scope-exit`), joins them, and lets the unwind continue. Otherwise, once `join` closes the scope, its outcome is resolved exhaustively in priority order:
+
+| Priority | Condition after `join` | Outcome | `with-scope` result |
+|---|---|---|---|
+| 1 | First task failure recorded (`scope-failure`) | `:failed` | Signals `sc:task-error` |
+| 2 | Scope token not cancelled | `:completed` | Returns body's values |
+| 3 | Token cancelled by an ancestor scope (`origin ≠ self`) | `:outer-cancelled` | Signals `sc:cancelled` (propagates even if cancelled during `join`) |
+| 4 | Token cancelled by this scope's `:timeout` | `:timed-out` | Signals `sc:timed-out` |
+| 5 | Token cancelled directly on this scope (`cancel-scope`) | `:cancelled` | Returns `nil` |
+
 ---
 
 ## Installation & Loading
@@ -139,7 +207,7 @@ Or add its directory to `CL_SOURCE_REGISTRY` (e.g. `/path/to/cl-scope//:`) and c
 With [qlot](https://github.com/fukamachi/qlot):
 
 ```text
-git cl-scope git@github.com:nohzafk/cl-scope.git
+git cl-scope https://github.com/nohzafk/cl-scope.git
 ```
 
 ---
@@ -170,7 +238,7 @@ git cl-scope git@github.com:nohzafk/cl-scope.git
 | `(sc:send chan x)` | Push `x` onto `chan` and wake waiters. Returns `x`. |
 | `(sc:recv chan &key timeout)` | Pop the next item from `chan`. Returns `(values item t)`, or `(values nil nil)` on timeout. Cancellable. |
 | `(sc:wait-on lock queue test &key timeout)` | Acquire `lock` and wait on `queue` until `(funcall test)` returns a non-nil value (called with `lock` held), or until `timeout` seconds pass (`nil`). Cancellable. |
-| `(sc:run program args)` | Run external `program` with string list `args`, merging stderr into stdout. Returns `(values output-string exit-code)`. On cancellation, terminates the process and its process group (`SIGTERM`, then `SIGKILL` on unwind). |
+| `(sc:run program args &key search)` | Run external `program` with string list `args` (pass `:search t` to search `$PATH`; otherwise an absolute path is required), merging stderr into stdout. Returns `(values output-string exit-code)`. On cancellation, terminates the process and its process group (`SIGTERM`, then `SIGKILL` on unwind). |
 | `(sc:read-line-from socket stream)` | Read one line from `stream` (or `:eof`). On cancellation, shuts `socket` down (`:direction :io`). |
 | `(sc:call-with-waker waker thunk)` | Run blocking `thunk`; if cancelled, invokes `waker` from the cancelling thread and signals `cancelled`. |
 | `(sc:check)` | Poll point: signals `cancelled` immediately if the current scope is cancelled. |
@@ -182,7 +250,7 @@ git cl-scope git@github.com:nohzafk/cl-scope.git
 |---|---|
 | `(sc:parked scope)` | Return the list of currently `:parked` tasks in `scope`. |
 | `(sc:answer task restart &rest args)` | Instruct a parked `task` to invoke `restart` with `args` inside its own thread. Returns `task`. |
-| `(sc:ask task thunk &key (timeout 5))` | Run zero-arg `thunk` inside the parked `task`'s thread (with its live dynamic bindings) and return its values (or `(:error message)` if `thunk` errors). |
+| `(sc:ask task thunk &key (timeout 5))` | Run zero-arg `thunk` inside the parked `task`'s thread (with its live dynamic bindings) and return its values (or `(values :error message)` if `thunk` errors; no values on timeout). |
 | `sc:retry` / `sc:give-up` / `sc:finish-with` | Built-in restart names offered by each task (unless `:restarts nil`). |
 
 ### Conditions & Special Variables
@@ -200,11 +268,11 @@ git cl-scope git@github.com:nohzafk/cl-scope.git
 
 ## Testing
 
-Run the full check suite (25 checks, ~6 seconds) or the mutation suite (7 mutants, ~2 minutes):
+Run the full check suite (30 checks, ~6 seconds) or the mutation suite (11 mutants, ~2 minutes):
 
 ```sh
 ./check.sh        # -v prints measured timings and diagnostics
-./mutants.sh      # removes 7 core behaviours one by one and verifies each fails a check
+./mutants.sh      # removes 11 core behaviours one by one and verifies each fails a check
 ```
 
 Or from Lisp via ASDF:
@@ -214,9 +282,9 @@ Or from Lisp via ASDF:
 ```
 
 The test suite (`test.lisp`) covers:
-- **S1–S9 (Scopes)**: join semantics, sibling cancellation on failure, body errors, nested inner-first unwind, timeouts, closed-scope rejection, `gather` ordering, `*inherit*`, and 200 concurrent tasks.
-- **W1–W7 (Cancellation)**: waking `pause`, `recv`, `run` (including child process groups), `read-line-from`, grace-period interrupt fallback, `stuck` signalling under `without-interrupts`, and `shielded` cleanup.
-- **P1–P8 (Parking)**: freezing a task while siblings finish, in-thread inspection with `ask`, live function redefinition + `retry`, `give-up`, scope timeout cancelling parked tasks, invalid restart diagnostics via `task-note`, multiple parked tasks, and `:restarts nil`.
+- **S1–S12 (Scopes)**: join semantics, sibling cancellation on failure, body errors, nested inner-first unwind, timeouts, closed-scope rejection, `gather` ordering, `*inherit*`, 200 concurrent tasks, outer cancellation during `join` / pre-cancelled entry, direct `cancel-scope` during `join`, and failed `spawn` cleanup.
+- **W1–W8 (Cancellation)**: waking `pause`, `recv`, `run` (including child process groups), `read-line-from`, grace-period interrupt fallback, `stuck` signalling under `without-interrupts`, `shielded` cleanup, and failing-waker isolation.
+- **P1–P9 (Parking)**: freezing a task while siblings finish, in-thread inspection with `ask`, live function redefinition + `retry`, `give-up`, scope timeout cancelling parked tasks, invalid restart diagnostics via `task-note`, multiple parked tasks, `:restarts nil`, and interrupting a parked task stuck in `*on-park*`.
 - **Thread leak check**: verifies every test returns with zero leaked SBCL threads.
 
 ---
@@ -236,3 +304,9 @@ The test suite (`test.lisp`) covers:
 - **[cl-cancel](https://github.com/atgreen/cl-cancel)**: provides hierarchical cancellation tokens, deadlines, and stream-closing cancellation, but no task scopes (no structured join or sibling cancellation on failure).
 - **[bordeaux-threads](https://sionescu.github.io/bordeaux-threads/)**: portable thread abstraction layer across CL implementations (a natural starting point if porting `cl-scope` beyond SBCL).
 - **CPS / green-thread libraries** (`cl-cont`, `green-threads`, `blackbird`): rewrite tasks into closure chains; `cl-scope` intentionally uses real SBCL threads so parked tasks retain genuine call stacks for backtraces, `ask`, and Common Lisp restarts.
+
+---
+
+## License
+
+MIT. See [LICENSE](LICENSE).
